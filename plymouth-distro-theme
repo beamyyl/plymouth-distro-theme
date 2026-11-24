@@ -292,8 +292,63 @@ fi
 
 DEST=${PREFIX:-$THEMES}/$NAME
 
+QUIT_INIT=none QUIT_FILE=
+if [[ -d /run/systemd/system || -x /usr/lib/systemd/systemd ]]; then QUIT_INIT=systemd
+elif command -v dinitctl >/dev/null && [[ -d /etc/dinit.d ]]; then QUIT_INIT=dinit; QUIT_FILE=/etc/dinit.d/plymouth-quit
+elif command -v openrc-run >/dev/null && [[ -d /etc/init.d ]]; then QUIT_INIT=openrc; QUIT_FILE=/etc/init.d/plymouth-quit
+fi
+
+install_quit_service() {
+    case $QUIT_INIT in
+        dinit)
+            cat > "$QUIT_FILE" <<'EOF'
+type          = scripted
+command       = /bin/sh -c "/usr/bin/plymouth --ping && /usr/bin/plymouth quit; exit 0"
+start-timeout = 10
+depends-on    = local.target
+before        = login.target
+EOF
+            chmod 644 "$QUIT_FILE"
+            mkdir -p /etc/dinit.d/boot.d
+            ln -sfn ../plymouth-quit /etc/dinit.d/boot.d/plymouth-quit
+            ;;
+        openrc)
+            cat > "$QUIT_FILE" <<'EOF'
+#!/sbin/openrc-run
+description="Stop the Plymouth boot splash before login"
+
+depend() {
+    need localmount
+    after bootmisc
+    before agetty xdm display-manager
+}
+
+start() {
+    ebegin "Stopping Plymouth"
+    /usr/bin/plymouth --ping && /usr/bin/plymouth quit
+    eend 0
+}
+EOF
+            chmod 755 "$QUIT_FILE"
+            rc-update add plymouth-quit default >/dev/null
+            ;;
+    esac
+}
+
+HOOK_PIXMAPS=()
+plan_pixmaps() {
+    local hook f
+    for hook in /etc/initcpio/install/plymouth /usr/lib/initcpio/install/plymouth; do
+        [[ -f $hook ]] && break
+    done
+    [[ -f $hook ]] || return 0
+    while read -r f; do
+        [[ -e $f ]] || HOOK_PIXMAPS+=("$f")
+    done < <(grep -oE "/usr/share/pixmaps/[^'\" ]+\.png" "$hook" | sort -u)
+}
+
 if ((APPLY)); then
-    [[ $INITRAMFS == mkinitcpio ]] && plan_hooks
+    [[ $INITRAMFS == mkinitcpio ]] && { plan_hooks; plan_pixmaps; }
     ((HAVE_GRUB)) && plan_grub
 
     say "plan"
@@ -304,7 +359,14 @@ if ((APPLY)); then
         mkinitcpio:ok)     note "$HOOKS_FILE already has the plymouth hook" ;;
         mkinitcpio:manual) note "can't parse HOOKS in $HOOKS_FILE, add 'plymouth' after 'kms' yourself" ;;
     esac
+    for f in "${HOOK_PIXMAPS[@]}"; do
+        note "plymouth hook needs missing $f, render it from the logo"
+    done
     [[ $INITRAMFS != none ]] && note "rebuild initramfs: $(initramfs_cmd)"
+    case $QUIT_INIT in
+        dinit|openrc) note "install and enable $QUIT_FILE ($QUIT_INIT one-shot: plymouth quit before login)" ;;
+        none)         note "unknown init: make sure something runs 'plymouth quit' before login" ;;
+    esac
     if ((HAVE_GRUB)); then
         case $GRUB_STATE in
             edit)   note "edit $GRUB_DEFAULT:"; note "  $GRUB_NEW"; note "regenerate GRUB: $(grub_regen_cmd)" ;;
@@ -414,6 +476,13 @@ if [[ $HOOKS_STATE == edit ]]; then
     say "added plymouth hook to $HOOKS_FILE"
 fi
 
+for f in "${HOOK_PIXMAPS[@]}"; do
+    mkdir -p "${f%/*}"
+    render "$LOGO_FILE" "$f" 128
+    chmod 644 "$f"
+    say "rendered logo to $f (needed by the plymouth hook)"
+done
+
 if [[ $INITRAMFS != none ]]; then
     say "rebuilding initramfs ($(initramfs_cmd))"
     if ! $(initramfs_cmd); then
@@ -426,6 +495,11 @@ if [[ $INITRAMFS != none ]]; then
     fi
 else
     say "no known initramfs generator; add plymouth to your initramfs yourself"
+fi
+
+if [[ $QUIT_INIT == dinit || $QUIT_INIT == openrc ]]; then
+    install_quit_service
+    say "installed and enabled $QUIT_FILE"
 fi
 
 if ((HAVE_GRUB)) && [[ $GRUB_STATE == edit ]]; then
@@ -449,11 +523,6 @@ elif ((!HAVE_GRUB)); then
         fi
         note "with GRUB it'd be $(grub_example) in $GRUB_DEFAULT"
     fi
-fi
-
-if [[ ! -d /run/systemd/system ]] && ! pgrep -x gdm >/dev/null; then
-    say "note: without systemd, only some display managers (GDM) tell plymouth to quit."
-    note "if the splash sticks around, run 'plymouth quit' before your DM/login starts."
 fi
 
 if [[ $INITRAMFS == mkinitcpio ]] && grep -q '^nvidia_drm ' /proc/modules 2>/dev/null \
