@@ -1,0 +1,465 @@
+#!/usr/bin/env bash
+# plymouth-distro-theme: build and apply a BGRT-style Plymouth theme for the running distro.
+# Firmware (UEFI/BGRT) logo in the middle, classic spinner below it,
+# distro logo from os-release LOGO= at the bottom.
+set -euo pipefail
+
+ARGS=("$@")
+PATH=$PATH:/usr/sbin:/sbin
+THEMES=/usr/share/plymouth/themes
+SPINNER=$THEMES/spinner
+GRUB_DEFAULT=/etc/default/grub
+STAMP=$(date +%Y%m%d-%H%M%S)
+HEIGHT=48
+LOGO_FILE=
+FALLBACK=
+NAME=
+PREFIX=
+APPLY=1
+YES=0
+
+usage() {
+    cat <<EOF
+usage: ${0##*/} [options]
+
+Builds the theme, installs it, and applies it: sets it as default, adds
+plymouth to the initramfs, adds 'quiet splash' to GRUB, and rebuilds both.
+
+  -l, --logo FILE      use FILE (svg/png) instead of the os-release logo
+  -H, --height PX      logo height in pixels (default: $HEIGHT)
+  -f, --fallback FILE  middle image when there is no UEFI logo (BIOS/CSM);
+                       'logo' uses a big copy of the distro logo
+  -n, --name NAME      theme name (default: <ID>-bgrt)
+  -b, --build-only     install the theme but don't touch initramfs/bootloader
+  -p, --prefix DIR     only build into DIR (no root, implies --build-only)
+  -y, --yes            don't ask before changing boot config
+  -h, --help           show this help
+EOF
+}
+
+die()  { printf '%s: %s\n' "${0##*/}" "$*" >&2; exit 1; }
+say()  { printf '==> %s\n' "$*"; }
+note() { printf '    %s\n' "$*"; }
+
+while (($#)); do
+    case $1 in
+        -l|--logo)       LOGO_FILE=${2:?}; shift ;;
+        -H|--height)     HEIGHT=${2:?}; shift ;;
+        -f|--fallback)   FALLBACK=${2:?}; shift ;;
+        -n|--name)       NAME=${2:?}; shift ;;
+        -b|--build-only) APPLY=0 ;;
+        -p|--prefix)     PREFIX=${2:?}; APPLY=0; shift ;;
+        -y|--yes)        YES=1 ;;
+        -s|--set)        ;;
+        -h|--help)       usage; exit 0 ;;
+        *)               usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
+[[ $HEIGHT =~ ^[0-9]+$ ]] || die "height must be a number"
+
+osrel() {
+    local f
+    for f in /etc/os-release /usr/lib/os-release; do
+        [[ -r $f ]] || continue
+        ( . "$f"; printf '%s' "${!1:-}" )
+        return
+    done
+}
+
+ID=$(osrel ID); ID=${ID:-linux}
+PRETTY=$(osrel PRETTY_NAME); PRETTY=${PRETTY:-$(osrel NAME)}; PRETTY=${PRETTY:-Linux}
+LOGO=$(osrel LOGO)
+NAME=${NAME:-$ID-bgrt}
+[[ $NAME =~ ^[A-Za-z0-9._-]+$ ]] || die "bad theme name: $NAME"
+
+PM=unknown
+for m in pacman apt dnf zypper xbps-install emerge apk; do
+    command -v "$m" >/dev/null && { PM=$m; break; }
+done
+
+pkg() {
+    case $PM:$1 in
+        pacman:render)       echo librsvg ;;
+        pacman:*)            echo plymouth ;;
+        apt:spinner)         echo plymouth-themes ;;
+        apt:render)          echo librsvg2-bin ;;
+        apt:*)               echo plymouth ;;
+        dnf:two-step|zypper:two-step) echo plymouth-plugin-two-step ;;
+        dnf:spinner|zypper:spinner)   echo plymouth-theme-spinner ;;
+        dnf:render)          echo librsvg2-tools ;;
+        zypper:render)       echo rsvg-convert ;;
+        dnf:*|zypper:*)      echo plymouth ;;
+        xbps-install:render) echo librsvg-utils ;;
+        xbps-install:*)      echo plymouth ;;
+        emerge:render)       echo gnome-base/librsvg ;;
+        emerge:*)            echo sys-boot/plymouth ;;
+        apk:spinner)         echo plymouth-themes ;;
+        apk:render)          echo rsvg-convert ;;
+        apk:*)               echo plymouth ;;
+        *:plymouth)          echo plymouth ;;
+        *:two-step)          echo "plymouth-two-step-plugin" ;;
+        *:spinner)           echo "plymouth-spinner-theme" ;;
+        *:render)            echo "librsvg(rsvg-convert)-or-imagemagick" ;;
+    esac
+}
+
+install_cmd() {
+    case $PM in
+        pacman)       echo "sudo pacman -S --needed" ;;
+        apt)          echo "sudo apt install" ;;
+        dnf)          echo "sudo dnf install" ;;
+        zypper)       echo "sudo zypper install" ;;
+        xbps-install) echo "sudo xbps-install -S" ;;
+        emerge)       echo "sudo emerge --ask" ;;
+        apk)          echo "doas apk add" ;;
+        *)            echo "install with your package manager:" ;;
+    esac
+}
+
+has_two_step() {
+    local d
+    d=$(plymouth --get-splash-plugin-path 2>/dev/null) && [[ -f $d/two-step.so ]] && return
+    compgen -G '/usr/lib*/plymouth/two-step.so' >/dev/null \
+        || compgen -G '/usr/lib/*/plymouth/two-step.so' >/dev/null
+}
+
+has_renderer() {
+    command -v rsvg-convert >/dev/null || command -v magick >/dev/null || command -v convert >/dev/null
+}
+
+INITRAMFS=none
+if command -v mkinitcpio >/dev/null; then INITRAMFS=mkinitcpio
+elif command -v dracut >/dev/null; then INITRAMFS=dracut
+elif command -v update-initramfs >/dev/null; then INITRAMFS=initramfs-tools
+fi
+
+GRUB_CFG=
+for c in /boot/grub/grub.cfg /boot/grub2/grub.cfg; do
+    [[ -f $c ]] && { GRUB_CFG=$c; break; }
+done
+HAVE_GRUB=0
+[[ -f $GRUB_DEFAULT && ( -n $GRUB_CFG || -n $(command -v update-grub) ) ]] && HAVE_GRUB=1
+
+mkinit_conf() {
+    local f c=/etc/mkinitcpio.conf
+    for f in /etc/mkinitcpio.conf.d/*.conf; do
+        [[ -f $f ]] && grep -qE '^[[:space:]]*HOOKS=' "$f" && c=$f
+    done
+    echo "$c"
+}
+
+HOOKS_FILE= HOOKS_LINE= HOOKS_NEW= HOOKS_STATE=
+plan_hooks() {
+    HOOKS_FILE=$(mkinit_conf)
+    local ln text i pos kms= early= enc=-1 arr
+    ln=$(grep -nE '^[[:space:]]*HOOKS=' "$HOOKS_FILE" | tail -n1) || { HOOKS_STATE=manual; return; }
+    HOOKS_LINE=${ln%%:*}; text=${ln#*:}
+    [[ $text =~ ^[[:space:]]*HOOKS=\(([^\)]*)\)[[:space:]]*(#.*)?$ ]] || { HOOKS_STATE=manual; return; }
+    read -ra arr <<<"${BASH_REMATCH[1]}"
+    for i in "${!arr[@]}"; do
+        case ${arr[i]} in
+            plymouth) HOOKS_STATE=ok; return ;;
+            kms) kms=$((i + 1)) ;;
+            base|udev|systemd) early=$((i + 1)) ;;
+            encrypt|sd-encrypt) ((enc >= 0)) || enc=$i ;;
+        esac
+    done
+    pos=${kms:-${early:-0}}
+    ((enc < 0 || pos <= enc)) || pos=$enc
+    HOOKS_NEW="HOOKS=(${arr[*]:0:pos} plymouth ${arr[*]:pos})"
+    HOOKS_NEW=${HOOKS_NEW//( /(}; HOOKS_NEW=${HOOKS_NEW// )/)}
+    HOOKS_STATE=edit
+}
+
+GRUB_LINE= GRUB_NEW= GRUB_STATE=
+plan_grub() {
+    local ln q val w add=()
+    ln=$(grep -nE '^GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUB_DEFAULT" | tail -n1) || ln=
+    if [[ -z $ln ]]; then
+        GRUB_LINE=new; GRUB_NEW='GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"'; GRUB_STATE=edit; return
+    fi
+    GRUB_LINE=${ln%%:*}
+    val=${ln#*:GRUB_CMDLINE_LINUX_DEFAULT=}
+    val=${val%"${val##*[![:space:]]}"}
+    if [[ $val == \"*\" && ${#val} -ge 2 ]]; then q=\"; val=${val:1:-1}
+    elif [[ $val == \'*\' && ${#val} -ge 2 ]]; then q=\'; val=${val:1:-1}
+    elif [[ $val =~ ^[^[:space:]\"\'\#]*$ ]]; then q=\"
+    else GRUB_STATE=manual; return
+    fi
+    [[ $val != *[\"\']* ]] || { GRUB_STATE=manual; return; }
+    for w in quiet splash; do
+        [[ " $val " == *" $w "* ]] || add+=("$w")
+    done
+    ((${#add[@]})) || { GRUB_STATE=ok; return; }
+    val="${val:+$val }${add[*]}"
+    GRUB_NEW="GRUB_CMDLINE_LINUX_DEFAULT=$q$val$q"
+    GRUB_STATE=edit
+}
+
+grub_example() {
+    local cur=
+    [[ -f $GRUB_DEFAULT ]] && cur=$(grep -E '^GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUB_DEFAULT" | tail -n1 \
+        | sed -E 's/^GRUB_CMDLINE_LINUX_DEFAULT=["'\'']?//; s/["'\'']?[[:space:]]*$//')
+    local w
+    for w in quiet splash; do [[ " $cur " == *" $w "* ]] || cur="${cur:+$cur }$w"; done
+    echo "GRUB_CMDLINE_LINUX_DEFAULT=\"$cur\""
+}
+
+grub_regen_cmd() {
+    if [[ $GRUB_CFG == /boot/grub/grub.cfg ]] && command -v grub-mkconfig >/dev/null; then
+        echo "grub-mkconfig -o /boot/grub/grub.cfg"
+    elif [[ $GRUB_CFG == /boot/grub2/grub.cfg ]] && command -v grub2-mkconfig >/dev/null; then
+        echo "grub2-mkconfig -o /boot/grub2/grub.cfg"
+    elif command -v update-grub >/dev/null; then
+        echo "update-grub"
+    else
+        echo "grub-mkconfig -o /boot/grub/grub.cfg"
+    fi
+}
+
+initramfs_cmd() {
+    case $INITRAMFS in
+        mkinitcpio)      echo "mkinitcpio -P" ;;
+        dracut)          echo "dracut --regenerate-all --force" ;;
+        initramfs-tools) echo "update-initramfs -u -k all" ;;
+    esac
+}
+
+manual_steps() {
+    echo "  1. initramfs:"
+    case $INITRAMFS in
+        mkinitcpio) echo "       add 'plymouth' to HOOKS in $(mkinit_conf), right after 'kms'"
+                    echo "       (before 'encrypt'/'sd-encrypt' if you have one), then: sudo mkinitcpio -P" ;;
+        dracut)     echo "       dracut adds plymouth on its own; run: sudo dracut --regenerate-all --force" ;;
+        initramfs-tools) echo "       initramfs-tools adds plymouth on its own; run: sudo update-initramfs -u -k all" ;;
+        *)          echo "       add plymouth to your initramfs generator and rebuild it" ;;
+    esac
+    echo "  2. GRUB: in $GRUB_DEFAULT set"
+    echo "       $(grub_example)"
+    echo "     then: sudo $(grub_regen_cmd)"
+    echo "     (other bootloaders: add 'quiet splash' to the kernel command line)"
+    echo "  3. sudo plymouth-set-default-theme $NAME"
+}
+
+MISSING=()
+command -v plymouth-set-default-theme >/dev/null || MISSING+=(plymouth)
+has_two_step || MISSING+=(two-step)
+[[ -d $SPINNER ]] || MISSING+=(spinner)
+has_renderer || MISSING+=(render)
+
+if ((${#MISSING[@]})); then
+    pkgs=$(for c in "${MISSING[@]}"; do pkg "$c"; done | awk '!s[$0]++' | tr '\n' ' ')
+    echo "missing: ${MISSING[*]}" >&2
+    echo >&2
+    echo "install:" >&2
+    echo "  $(install_cmd) ${pkgs% }" >&2
+    echo >&2
+    echo "then run ${0##*/} again and it does the rest. by hand, that is:" >&2
+    manual_steps >&2
+    exit 1
+fi
+
+if [[ -z $LOGO_FILE ]]; then
+    find_logo() {
+        local n d s f best= bestsz=0
+        for n in "$@"; do
+            [[ -n $n ]] || continue
+            for d in /usr/share/pixmaps /usr/share/icons/hicolor/scalable/apps; do
+                [[ -f $d/$n.svg ]] && { echo "$d/$n.svg"; return; }
+            done
+            for f in /usr/share/icons/hicolor/*/apps/"$n".png /usr/share/pixmaps/"$n".png; do
+                [[ -f $f ]] || continue
+                s=${f#/usr/share/icons/hicolor/}; s=${s%%x*}
+                [[ $s =~ ^[0-9]+$ ]] || s=1
+                ((s > bestsz)) && { best=$f; bestsz=$s; }
+            done
+            [[ -n $best ]] && { echo "$best"; return; }
+        done
+        return 1
+    }
+    LOGO_FILE=$(find_logo "$LOGO" "$ID-logo" "$ID" distributor-logo) \
+        || die "no logo found for LOGO=${LOGO:-unset}; pass one with --logo"
+fi
+[[ -f $LOGO_FILE ]] || die "logo not found: $LOGO_FILE"
+[[ $FALLBACK == logo ]] && FALLBACK=$LOGO_FILE
+[[ -z $FALLBACK || -f $FALLBACK ]] || die "fallback not found: $FALLBACK"
+
+if [[ -z $PREFIX && $EUID -ne 0 ]]; then
+    exec sudo -- "$0" "${ARGS[@]}"
+fi
+
+DEST=${PREFIX:-$THEMES}/$NAME
+
+if ((APPLY)); then
+    [[ $INITRAMFS == mkinitcpio ]] && plan_hooks
+    ((HAVE_GRUB)) && plan_grub
+
+    say "plan"
+    note "install theme '$NAME' to $DEST (logo: $LOGO_FILE)"
+    note "set default theme: $(plymouth-set-default-theme 2>/dev/null || echo none) -> $NAME"
+    case $INITRAMFS:$HOOKS_STATE in
+        mkinitcpio:edit)   note "edit $HOOKS_FILE line $HOOKS_LINE:"; note "  $HOOKS_NEW" ;;
+        mkinitcpio:ok)     note "$HOOKS_FILE already has the plymouth hook" ;;
+        mkinitcpio:manual) note "can't parse HOOKS in $HOOKS_FILE, add 'plymouth' after 'kms' yourself" ;;
+    esac
+    [[ $INITRAMFS != none ]] && note "rebuild initramfs: $(initramfs_cmd)"
+    if ((HAVE_GRUB)); then
+        case $GRUB_STATE in
+            edit)   note "edit $GRUB_DEFAULT:"; note "  $GRUB_NEW"; note "regenerate GRUB: $(grub_regen_cmd)" ;;
+            ok)     note "$GRUB_DEFAULT already has 'quiet splash'" ;;
+            manual) note "can't parse $GRUB_DEFAULT, set: $(grub_example)" ;;
+        esac
+    fi
+    [[ $HOOKS_STATE == edit || $GRUB_STATE == edit ]] && note "edited files get a .bak-$STAMP copy next to them"
+
+    if ((!YES)); then
+        { true </dev/tty; } 2>/dev/null || die "not interactive; rerun with --yes"
+        printf 'proceed? [y/N] '
+        read -r reply </dev/tty
+        [[ $reply == [yY]* ]] || die "aborted, nothing changed"
+    fi
+fi
+
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+render() {
+    local in=$1 out=$2 h=${3:-$HEIGHT}
+    if [[ $in == *.svg ]] && command -v rsvg-convert >/dev/null; then
+        rsvg-convert -h "$h" -a -o "$out" "$in"
+    elif command -v magick >/dev/null; then
+        magick -background none -density 384 "$in" -resize "x$h" "$out"
+    else
+        convert -background none -density 384 "$in" -resize "x$h" "$out"
+    fi
+}
+
+for f in "$SPINNER"/*.png; do
+    [[ ${f##*/} == watermark.png ]] || cp "$f" "$TMP/"
+done
+render "$LOGO_FILE" "$TMP/watermark.png"
+[[ -n $FALLBACK ]] && render "$FALLBACK" "$TMP/bgrt-fallback.png" $((HEIGHT * 4))
+
+IMAGEDIR=$THEMES/$NAME
+{
+    printf '[Plymouth Theme]\nName=%s\n' "$PRETTY"
+    printf 'Description=Firmware logo, spinner and %s logo\nModuleName=two-step\n\n' "$PRETTY"
+    if [[ -f $THEMES/bgrt/bgrt.plymouth ]]; then
+        sed -n '/^\[two-step\]/,$p' "$THEMES/bgrt/bgrt.plymouth" \
+            | sed "s|^ImageDir=.*|ImageDir=$IMAGEDIR|"
+    else
+        cat <<EOF
+[two-step]
+Font=Sans 12
+TitleFont=Sans Light 30
+ImageDir=$IMAGEDIR
+DialogHorizontalAlignment=.5
+DialogVerticalAlignment=.382
+TitleHorizontalAlignment=.5
+TitleVerticalAlignment=.382
+HorizontalAlignment=.5
+VerticalAlignment=.7
+WatermarkHorizontalAlignment=.5
+WatermarkVerticalAlignment=.96
+Transition=none
+TransitionDuration=0.0
+BackgroundStartColor=0x000000
+BackgroundEndColor=0x000000
+ProgressBarBackgroundColor=0x606060
+ProgressBarForegroundColor=0xffffff
+DialogClearsFirmwareBackground=true
+MessageBelowAnimation=true
+
+[boot-up]
+UseEndAnimation=false
+UseFirmwareBackground=true
+
+[shutdown]
+UseEndAnimation=false
+UseFirmwareBackground=true
+
+[reboot]
+UseEndAnimation=false
+UseFirmwareBackground=true
+EOF
+    fi
+} > "$TMP/$NAME.plymouth"
+
+mkdir -p "$DEST"
+rm -f "$DEST"/*.png "$DEST"/*.plymouth
+cp "$TMP"/* "$DEST/"
+chmod 644 "$DEST"/*
+say "installed $NAME in $DEST"
+
+((APPLY)) || exit 0
+
+replace_line() {
+    local file=$1 num=$2 line=$3
+    if [[ $num == new ]]; then
+        printf '%s\n' "$line" >> "$file"
+    else
+        L=$line awk -v n="$num" 'NR == n { print ENVIRON["L"]; next } 1' "$file" > "$TMP/edit"
+        cat "$TMP/edit" > "$file"
+    fi
+}
+
+plymouth-set-default-theme "$NAME"
+say "default theme set to $NAME"
+
+if [[ $HOOKS_STATE == edit ]]; then
+    cp -a "$HOOKS_FILE" "$HOOKS_FILE.bak-$STAMP"
+    replace_line "$HOOKS_FILE" "$HOOKS_LINE" "$HOOKS_NEW"
+    say "added plymouth hook to $HOOKS_FILE"
+fi
+
+if [[ $INITRAMFS != none ]]; then
+    say "rebuilding initramfs ($(initramfs_cmd))"
+    if ! $(initramfs_cmd); then
+        if [[ $HOOKS_STATE == edit ]]; then
+            cp -a "$HOOKS_FILE.bak-$STAMP" "$HOOKS_FILE"
+            say "rebuild failed; restored $HOOKS_FILE and rebuilding the old initramfs"
+            $(initramfs_cmd) || true
+        fi
+        die "initramfs rebuild failed, boot config left as it was"
+    fi
+else
+    say "no known initramfs generator; add plymouth to your initramfs yourself"
+fi
+
+if ((HAVE_GRUB)) && [[ $GRUB_STATE == edit ]]; then
+    cp -a "$GRUB_DEFAULT" "$GRUB_DEFAULT.bak-$STAMP"
+    replace_line "$GRUB_DEFAULT" "$GRUB_LINE" "$GRUB_NEW"
+    say "added quiet splash to $GRUB_DEFAULT"
+    say "regenerating GRUB ($(grub_regen_cmd))"
+    if ! $(grub_regen_cmd); then
+        cp -a "$GRUB_DEFAULT.bak-$STAMP" "$GRUB_DEFAULT"
+        die "GRUB regeneration failed; restored $GRUB_DEFAULT"
+    fi
+elif ((!HAVE_GRUB)); then
+    if [[ " $(</proc/cmdline) " != *" splash "* ]]; then
+        say "GRUB not found; add 'quiet splash' to your kernel command line:"
+        if compgen -G '/boot/loader/entries/*.conf' >/dev/null || compgen -G '/efi/loader/entries/*.conf' >/dev/null; then
+            note "systemd-boot: the 'options' line in /boot/loader/entries/*.conf"
+        elif compgen -G '/boot/limine.conf' >/dev/null || compgen -G '/boot/limine/limine.conf' >/dev/null; then
+            note "limine: the 'cmdline:' line in limine.conf"
+        elif [[ -f /boot/refind_linux.conf ]]; then
+            note "rEFInd: the options string in /boot/refind_linux.conf"
+        fi
+        note "with GRUB it'd be $(grub_example) in $GRUB_DEFAULT"
+    fi
+fi
+
+if [[ ! -d /run/systemd/system ]] && ! pgrep -x gdm >/dev/null; then
+    say "note: without systemd, only some display managers (GDM) tell plymouth to quit."
+    note "if the splash sticks around, run 'plymouth quit' before your DM/login starts."
+fi
+
+if [[ $INITRAMFS == mkinitcpio ]] && grep -q '^nvidia_drm ' /proc/modules 2>/dev/null \
+    && ! grep -qE '^[[:space:]]*MODULES=\(.*nvidia_drm' "$(mkinit_conf)" /etc/mkinitcpio.conf 2>/dev/null; then
+    say "tip: NVIDIA detected. for a flicker-free splash, add"
+    note "nvidia nvidia_modeset nvidia_uvm nvidia_drm to MODULES and rebuild"
+fi
+
+say "done, reboot to see it"
