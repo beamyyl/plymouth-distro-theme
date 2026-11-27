@@ -292,11 +292,23 @@ fi
 
 DEST=${PREFIX:-$THEMES}/$NAME
 
-QUIT_INIT=none QUIT_FILE=
-if [[ -d /run/systemd/system || -x /usr/lib/systemd/systemd ]]; then QUIT_INIT=systemd
-elif command -v dinitctl >/dev/null && [[ -d /etc/dinit.d ]]; then QUIT_INIT=dinit; QUIT_FILE=/etc/dinit.d/plymouth-quit
-elif command -v openrc-run >/dev/null && [[ -d /etc/init.d ]]; then QUIT_INIT=openrc; QUIT_FILE=/etc/init.d/plymouth-quit
-fi
+detect_init() {
+    case $(cat /proc/1/comm 2>/dev/null) in
+        systemd) echo systemd; return ;;
+        dinit)   echo dinit; return ;;
+    esac
+    [[ -d /run/systemd/system ]] && { echo systemd; return; }
+    if [[ -d /run/openrc ]] || command -v openrc-run >/dev/null; then echo openrc; return; fi
+    if command -v dinitctl >/dev/null && [[ -d /etc/dinit.d ]]; then echo dinit; return; fi
+    [[ -x /usr/lib/systemd/systemd ]] && { echo systemd; return; }
+    echo none
+}
+
+QUIT_INIT=$(detect_init) QUIT_FILE=
+case $QUIT_INIT in
+    dinit)  QUIT_FILE=/etc/dinit.d/plymouth-quit ;;
+    openrc) QUIT_FILE=/etc/init.d/plymouth-quit ;;
+esac
 
 install_quit_service() {
     case $QUIT_INIT in
@@ -332,6 +344,13 @@ EOF
             chmod 755 "$QUIT_FILE"
             rc-update add plymouth-quit default >/dev/null
             ;;
+        systemd)
+            local u
+            for u in plymouth-quit.service plymouth-quit-wait.service; do
+                systemctl cat "$u" >/dev/null 2>&1 || continue
+                systemctl is-enabled --quiet "$u" 2>/dev/null || systemctl enable "$u" >/dev/null
+            done
+            ;;
     esac
 }
 
@@ -365,6 +384,7 @@ if ((APPLY)); then
     [[ $INITRAMFS != none ]] && note "rebuild initramfs: $(initramfs_cmd)"
     case $QUIT_INIT in
         dinit|openrc) note "install and enable $QUIT_FILE ($QUIT_INIT one-shot: plymouth quit before login)" ;;
+        systemd)      note "enable plymouth-quit.service and plymouth-quit-wait.service if they aren't" ;;
         none)         note "unknown init: make sure something runs 'plymouth quit' before login" ;;
     esac
     if ((HAVE_GRUB)); then
@@ -497,10 +517,16 @@ else
     say "no known initramfs generator; add plymouth to your initramfs yourself"
 fi
 
-if [[ $QUIT_INIT == dinit || $QUIT_INIT == openrc ]]; then
-    install_quit_service
-    say "installed and enabled $QUIT_FILE"
-fi
+case $QUIT_INIT in
+    dinit|openrc)
+        install_quit_service
+        say "installed and enabled $QUIT_FILE"
+        ;;
+    systemd)
+        install_quit_service
+        say "enabled plymouth quit units for systemd"
+        ;;
+esac
 
 if ((HAVE_GRUB)) && [[ $GRUB_STATE == edit ]]; then
     cp -a "$GRUB_DEFAULT" "$GRUB_DEFAULT.bak-$STAMP"
